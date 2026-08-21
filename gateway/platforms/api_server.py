@@ -95,6 +95,7 @@ from gateway.platforms.base import (
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
+from gateway.api_operation_store import OperationConflict, OperationStore
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
 from agent.secret_scope import get_secret as _scoped_get_secret
@@ -1419,6 +1420,12 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
+        operation_db_path = extra.get("operation_db_path")
+        if not operation_db_path:
+            from hermes_constants import get_hermes_home
+
+            operation_db_path = str(get_hermes_home() / "api_operations.db")
+        self._operation_store = OperationStore(operation_db_path)
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
         # Creation timestamps for orphaned-run TTL sweep
@@ -2092,6 +2099,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
             ("POST", "/v1/runs", self._handle_runs),
+            ("GET", "/internal/operations/{operation_id}", self._handle_get_operation),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
@@ -6575,6 +6583,7 @@ class APIServerAdapter(BasePlatformAdapter):
         current.setdefault("created_at", fields.pop("created_at", now))
         current.update(fields)
         self._run_statuses[run_id] = current
+        self._operation_store.update_status(run_id, current)
         return current
 
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
@@ -6757,8 +6766,72 @@ class APIServerAdapter(BasePlatformAdapter):
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
 
+        operation_id = request.headers.get("X-RPCS-Operation-Id")
+        actor_id = request.headers.get("X-RPCS-Actor-Id")
+        supplied_hash = request.headers.get("X-RPCS-Request-Hash")
+        spec_hash = request.headers.get("X-RPCS-Spec-Hash")
+        operation_headers = (operation_id, actor_id, supplied_hash, spec_hash)
+        if any(operation_headers) and not all(operation_headers):
+            return web.json_response(
+                _openai_error(
+                    "X-RPCS-Operation-Id, X-RPCS-Actor-Id, "
+                    "X-RPCS-Request-Hash and X-RPCS-Spec-Hash must be supplied together",
+                    code="invalid_operation_binding",
+                ),
+                status=400,
+            )
+        request_hash = hashlib.sha256(
+            json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        ).hexdigest()
+        if supplied_hash and not hmac.compare_digest(supplied_hash, request_hash):
+            return web.json_response(
+                _openai_error("Canonical request hash mismatch", code="request_hash_mismatch"),
+                status=400,
+            )
+
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = session_id or run_id
+        prepared_operation = None
+        if operation_id:
+            initial_status = {
+                "object": "hermes.run",
+                "run_id": run_id,
+                "status": "queued",
+                "created_at": time.time(),
+                "updated_at": time.time(),
+                "session_id": session_id,
+                "model": body.get("model", self._model_name),
+            }
+            try:
+                prepared_operation = self._operation_store.prepare(
+                    operation_id=operation_id,
+                    actor_id=actor_id,
+                    endpoint_kind="runs.create",
+                    request_hash=request_hash,
+                    profile=_api_request_profile.get() or "default",
+                    spec_hash=spec_hash,
+                    object_id=run_id,
+                    initial_status=initial_status,
+                )
+            except OperationConflict:
+                return web.json_response(
+                    _openai_error(
+                        "Operation id is already bound to a different request",
+                        code="operation_conflict",
+                    ),
+                    status=409,
+                )
+            run_id = prepared_operation.object_id
+            if prepared_operation.replayed:
+                persisted = self._operation_store.get_status(run_id)
+                if persisted:
+                    self._run_statuses[run_id] = persisted
+                if prepared_operation.state != "queued":
+                    return web.json_response(
+                        {"run_id": run_id, "status": prepared_operation.state, "replayed": True},
+                        status=200,
+                    )
+            session_id = body.get("session_id") or stored_session_id or run_id
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
         # conversation/memory scopes, not authorization namespaces: multiple
@@ -6810,6 +6883,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
         async def _run_and_close():
             try:
+                if operation_id and not self._operation_store.claim_dispatch(operation_id):
+                    return
                 self._set_run_status(run_id, "running")
                 if run_id in self._stopping_run_ids:
                     _put_event_if_active({
@@ -7081,10 +7156,22 @@ class APIServerAdapter(BasePlatformAdapter):
             {"X-Hermes-Session-Key": gateway_session_key} if gateway_session_key else {}
         )
         return web.json_response(
-            {"run_id": run_id, "status": "started"},
+            {"run_id": run_id, "status": "started", **({"replayed": True} if prepared_operation and prepared_operation.replayed else {})},
             status=202,
             headers=response_headers,
         )
+
+    async def _handle_get_operation(self, request: "web.Request") -> "web.Response":
+        """Return the durable binding and current object status for recovery."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        operation = self._operation_store.get_by_operation(request.match_info["operation_id"])
+        if operation is None:
+            return web.json_response(
+                _openai_error("Operation not found", code="operation_not_found"), status=404
+            )
+        return web.json_response(operation)
 
     async def _handle_get_run(self, request: "web.Request") -> "web.Response":
         """GET /v1/runs/{run_id} — return pollable run status for external UIs."""
@@ -7094,6 +7181,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
         run_id = request.match_info["run_id"]
         status = self._run_statuses.get(run_id)
+        if status is None:
+            status = self._operation_store.get_status(run_id)
         if status is None:
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
@@ -7603,6 +7692,13 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 logger.debug(
                     "Failed to close response store for %s", self.name, exc_info=True,
+                )
+        if self._operation_store is not None:
+            try:
+                self._operation_store.close()
+            except Exception:
+                logger.debug(
+                    "Failed to close operation store for %s", self.name, exc_info=True,
                 )
         try:
             if self._site:
