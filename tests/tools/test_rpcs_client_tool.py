@@ -1,6 +1,7 @@
 import json
 
 from tools import rpcs_client_tool
+from tools.tool_search import is_deferrable_tool_name
 
 
 def test_rpcs_client_tool_waits_for_cli_and_returns_asset(monkeypatch):
@@ -35,3 +36,7 @@ def test_rpcs_client_tool_is_hidden_without_bridge_configuration(monkeypatch):
     for name in ("RPCS_CONTROL_URL", "RPCS_HERMES_INGRESS_KEY", "RPCS_ACTOR_ID"):
         monkeypatch.delenv(name, raising=False)
     assert rpcs_client_tool.check_rpcs_client_requirements() is False
+
+
+def test_rpcs_client_tool_is_core_and_never_deferred():
+    assert is_deferrable_tool_name("rpcs_onboard_ssh_host") is False
