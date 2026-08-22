@@ -2110,6 +2110,8 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/v1/runs", self._handle_runs),
             ("GET", "/internal/operations/{operation_id}", self._handle_get_operation),
             ("POST", "/internal/kanban/roots", self._handle_create_kanban_root),
+            ("POST", "/internal/kanban/graphs", self._handle_create_kanban_graph),
+            ("POST", "/internal/kanban/barriers/{task_id}/complete", self._handle_complete_barrier),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
@@ -7304,6 +7306,69 @@ class APIServerAdapter(BasePlatformAdapter):
             {"task_id": prepared.object_id, "status": "blocked", "replayed": prepared.replayed},
             status=200 if prepared.replayed else 201,
         )
+
+    async def _handle_create_kanban_graph(self, request: "web.Request") -> "web.Response":
+        """Atomically compile a worker graph with control-owned barriers."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        operation_id = request.headers.get("X-RPCS-Operation-Id")
+        actor_id = request.headers.get("X-RPCS-Actor-Id")
+        supplied_hash = request.headers.get("X-RPCS-Request-Hash")
+        spec_hash = request.headers.get("X-RPCS-Spec-Hash")
+        if not all((operation_id, actor_id, supplied_hash, spec_hash)):
+            return web.json_response(_openai_error("Complete RPCS operation binding is required"), status=400)
+        request_hash = hashlib.sha256(
+            json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        ).hexdigest()
+        if not hmac.compare_digest(supplied_hash, request_hash) or body.get("spec_hash") != spec_hash:
+            return web.json_response(_openai_error("Graph binding mismatch"), status=400)
+        try:
+            prepared, status = self._operation_store.prepare_kanban_graph(
+                operation_id=operation_id, actor_id=actor_id, request_hash=request_hash,
+                profile=_api_request_profile.get() or "default", spec_hash=spec_hash,
+                root_task_id=body.get("root_task_id", ""), nodes=body.get("nodes", []),
+            )
+        except OperationConflict:
+            return web.json_response(_openai_error("Operation conflict", code="operation_conflict"), status=409)
+        except (KeyError, TypeError, ValueError) as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        return web.json_response({**status, "replayed": prepared.replayed}, status=200 if prepared.replayed else 201)
+
+    async def _handle_complete_barrier(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        operation_id = request.headers.get("X-RPCS-Operation-Id")
+        actor_id = request.headers.get("X-RPCS-Actor-Id")
+        supplied_hash = request.headers.get("X-RPCS-Request-Hash")
+        spec_hash = request.headers.get("X-RPCS-Spec-Hash")
+        if not all((operation_id, actor_id, supplied_hash, spec_hash)):
+            return web.json_response(_openai_error("Complete RPCS operation binding is required"), status=400)
+        request_hash = hashlib.sha256(
+            json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        ).hexdigest()
+        if not hmac.compare_digest(supplied_hash, request_hash) or body.get("spec_hash") != spec_hash:
+            return web.json_response(_openai_error("Validation binding mismatch"), status=400)
+        try:
+            prepared, status = self._operation_store.complete_validation_barrier(
+                operation_id=operation_id, actor_id=actor_id, request_hash=request_hash,
+                profile=_api_request_profile.get() or "default", spec_hash=spec_hash,
+                barrier_task_id=request.match_info["task_id"], validation=body,
+            )
+        except OperationConflict:
+            return web.json_response(_openai_error("Operation conflict", code="operation_conflict"), status=409)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=409)
+        return web.json_response({**status, "replayed": prepared.replayed}, status=200)
 
     async def _handle_get_run(self, request: "web.Request") -> "web.Response":
         """GET /v1/runs/{run_id} — return pollable run status for external UIs."""

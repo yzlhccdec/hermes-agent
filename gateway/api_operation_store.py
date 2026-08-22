@@ -6,6 +6,7 @@ import json
 import sqlite3
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -110,6 +111,133 @@ class OperationStore:
                  json.dumps(status, sort_keys=True, separators=(",", ":")), now, now),
             )
         return PreparedOperation(operation_id, task_id, "completed", False)
+
+    def prepare_kanban_graph(
+        self, *, operation_id: str, actor_id: str, request_hash: str,
+        profile: str, spec_hash: str, root_task_id: str, nodes: list[dict[str, Any]],
+    ) -> tuple[PreparedOperation, dict[str, Any]]:
+        """Atomically compile workers, blocked validation barriers and links."""
+        from hermes_cli import kanban_db as kb
+
+        endpoint_kind = "kanban.graphs.create"
+        binding = (actor_id, endpoint_kind, request_hash, profile, spec_hash)
+        now = time.time()
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT * FROM api_operations WHERE operation_id = ?", (operation_id,)
+            ).fetchone()
+            if row is not None:
+                existing = tuple(row[key] for key in (
+                    "actor_id", "endpoint_kind", "request_hash", "profile", "spec_hash"
+                ))
+                if existing != binding:
+                    raise OperationConflict(operation_id)
+                status = json.loads(row["status_json"])
+                return PreparedOperation(operation_id, row["object_id"], row["state"], True), status
+            if kb.get_task(self._conn, root_task_id) is None:
+                raise ValueError("root task not found")
+            graph_id = f"graph_{uuid.uuid4().hex}"
+            task_ids: dict[str, str] = {}
+            barrier_ids: dict[str, str] = {}
+            for node in nodes:
+                parents = [barrier_ids[key] for key in node.get("depends_on", [])]
+                task_id = kb.create_task(
+                    self._conn,
+                    title=node["title"],
+                    body=json.dumps({"objective": node["objective"], "spec_hash": spec_hash},
+                                    sort_keys=True, ensure_ascii=False),
+                    assignee=node["profile"],
+                    created_by="rpcs-control",
+                    tenant=actor_id,
+                    parents=parents,
+                    idempotency_key=f"{operation_id}:worker:{node['key']}",
+                    initial_status="running",
+                )
+                barrier_id = kb.create_task(
+                    self._conn,
+                    title=f"Validate: {node['title']}",
+                    body=json.dumps({"worker_task_id": task_id, "spec_hash": spec_hash},
+                                    sort_keys=True, ensure_ascii=False),
+                    assignee=None,
+                    created_by="rpcs-control",
+                    tenant=actor_id,
+                    parents=[task_id],
+                    idempotency_key=f"{operation_id}:validate:{node['key']}",
+                    initial_status="blocked",
+                )
+                task_ids[node["key"]] = task_id
+                barrier_ids[node["key"]] = barrier_id
+            depended_on = {dep for node in nodes for dep in node.get("depends_on", [])}
+            final_keys = [node["key"] for node in nodes if node["key"] not in depended_on]
+            for key in final_keys:
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO task_links(parent_id,child_id) VALUES(?,?)",
+                    (barrier_ids[key], root_task_id),
+                )
+            status = {
+                "object": "hermes.kanban.graph", "graph_id": graph_id,
+                "root_task_id": root_task_id, "status": "compiled",
+                "spec_hash": spec_hash, "tasks": task_ids, "barriers": barrier_ids,
+            }
+            self._conn.execute(
+                """INSERT INTO api_operations
+                   (operation_id, actor_id, endpoint_kind, request_hash, profile,
+                    spec_hash, object_id, state, status_json, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'completed', ?, ?, ?)""",
+                (*((operation_id,) + binding + (graph_id,)),
+                 json.dumps(status, sort_keys=True, separators=(",", ":")), now, now),
+            )
+        return PreparedOperation(operation_id, graph_id, "completed", False), status
+
+    def complete_validation_barrier(
+        self, *, operation_id: str, actor_id: str, request_hash: str,
+        profile: str, spec_hash: str, barrier_task_id: str, validation: dict[str, Any],
+    ) -> tuple[PreparedOperation, dict[str, Any]]:
+        from hermes_cli import kanban_db as kb
+
+        endpoint_kind = "kanban.barriers.complete"
+        binding = (actor_id, endpoint_kind, request_hash, profile, spec_hash)
+        now = time.time()
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT * FROM api_operations WHERE operation_id=?", (operation_id,)
+            ).fetchone()
+            if row is not None:
+                existing = tuple(row[key] for key in (
+                    "actor_id", "endpoint_kind", "request_hash", "profile", "spec_hash"
+                ))
+                if existing != binding:
+                    raise OperationConflict(operation_id)
+                status = json.loads(row["status_json"])
+                return PreparedOperation(operation_id, row["object_id"], row["state"], True), status
+            task = kb.get_task(self._conn, barrier_task_id)
+            if task is None or task.tenant != actor_id:
+                raise ValueError("validation barrier not found")
+            try:
+                task_body = json.loads(task.body or "{}")
+            except json.JSONDecodeError as exc:
+                raise ValueError("invalid validation barrier") from exc
+            if task_body.get("spec_hash") != spec_hash or not task_body.get("worker_task_id"):
+                raise ValueError("validation barrier binding mismatch")
+            if not kb.complete_task(
+                self._conn, barrier_task_id, result="validated",
+                summary="RPCS Contract Guard passed",
+                metadata={"validation_record": validation}, fire_lifecycle_hook=False,
+            ):
+                raise ValueError("validation barrier is not completable")
+            validation_object_id = f"validation_{uuid.uuid4().hex}"
+            status = {"object": "hermes.kanban.validation", "validation_id": validation_object_id,
+                      "barrier_task_id": barrier_task_id, "status": "completed",
+                      "spec_hash": spec_hash}
+            self._conn.execute(
+                """INSERT INTO api_operations
+                   (operation_id, actor_id, endpoint_kind, request_hash, profile,
+                    spec_hash, object_id, state, status_json, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'completed', ?, ?, ?)""",
+                (*((operation_id,) + binding + (validation_object_id,)),
+                 json.dumps(status, sort_keys=True, separators=(",", ":")), now, now),
+            )
+        return PreparedOperation(operation_id, validation_object_id, "completed", False), status
 
     def prepare(
         self, *, operation_id: str, actor_id: str, endpoint_kind: str,
