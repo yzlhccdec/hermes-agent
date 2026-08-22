@@ -710,6 +710,24 @@ def _(rid, params: dict) -> dict:
         session["last_active"] = time.time()
         _start_inflight_turn(session, text)
 
+    if isinstance(text, str):
+        rpcs_error = _rpcs_plan_prompt(rid, sid, session, text)
+        if rpcs_error:
+            with session["history_lock"]:
+                session["running"] = False
+                session["last_active"] = time.time()
+                _clear_inflight_turn(session)
+            return _err(rid, 5033, f"RPCS pre-dispatch blocked the turn: {rpcs_error}")
+        if turn_isolation and session.get("_rpcs_dispatch"):
+            with session["history_lock"]:
+                session["running"] = False
+                session["last_active"] = time.time()
+                _clear_inflight_turn(session)
+            return _err(
+                rid, 5033,
+                "RPCS managed dispatch does not yet support dashboard.turn_isolation",
+            )
+
     if turn_isolation:
         isolated_response = _submit_prompt_to_compute_host(
             rid, sid, session, text, display_kind=display_kind
@@ -799,6 +817,23 @@ def _(rid, params: dict) -> dict:
                     },
                 )
                 return
+        try:
+            resolved_dispatch = _rpcs_resolve_prompt(session)
+            if resolved_dispatch:
+                from .rpcs_gate import route_markdown
+
+                _emit("message.interim", sid, {"content": route_markdown(resolved_dispatch)})
+                _emit("session.info", sid, {
+                    **_session_info(session.get("agent"), session),
+                    "rpcs_route": resolved_dispatch.get("display") or resolved_dispatch,
+                })
+        except Exception as exc:
+            logger.warning("RPCS route resolution failed: %s", exc)
+            _emit_terminal_turn_error(sid, session, f"RPCS route resolution blocked the turn: {exc}")
+            with session["history_lock"]:
+                session["running"] = False
+                session["last_active"] = time.time()
+            return
         _run_prompt_submit(rid, sid, session, text, display_kind=display_kind)
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)

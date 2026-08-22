@@ -8183,6 +8183,24 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             return True
     dispatch_failed = False
     try:
+        queued_rpcs_error = _rpcs_plan_prompt(
+            f"queued-{uuid.uuid4().hex}", sid, session, queued["text"]
+        )
+        if queued_rpcs_error:
+            raise RuntimeError(queued_rpcs_error)
+        if use_compute_host and session.get("_rpcs_dispatch"):
+            raise RuntimeError(
+                "RPCS managed dispatch does not yet support dashboard.turn_isolation"
+            )
+        queued_resolved = _rpcs_resolve_prompt(session)
+        if queued_resolved:
+            from .rpcs_gate import route_markdown
+
+            _emit("message.interim", sid, {"content": route_markdown(queued_resolved)})
+            _emit("session.info", sid, {
+                **_session_info(session.get("agent"), session),
+                "rpcs_route": queued_resolved.get("display") or queued_resolved,
+            })
         if use_compute_host:
             if queued.get("image_paths"):
                 resp = _submit_prompt_to_compute_host(
@@ -10468,6 +10486,68 @@ def _start_usage_ticker(
     thread = _RealThread(target=_loop, daemon=True)
     thread.start()
     return stop, thread
+
+
+def _rpcs_plan_prompt(rid, sid: str, session: dict, text: str) -> str | None:
+    """Plan a managed turn before agent construction; return an error message."""
+    try:
+        from .rpcs_gate import load_gate_config, plan_dispatch
+
+        cfg = load_gate_config(_load_cfg())
+        if not cfg.enabled:
+            return None
+        planned = plan_dispatch(
+            cfg,
+            surface="hermes-hud" if session.get("client_surface") == "hud" else "hermes-native",
+            surface_session_id=sid,
+            turn_id=str(rid),
+            text=text,
+            current_session_id=session.get("_rpcs_external_session_id"),
+        )
+        session["_rpcs_gate_config"] = cfg
+        session["_rpcs_dispatch"] = planned
+        session["_rpcs_external_session_id"] = planned.get("session_id")
+        return None
+    except Exception as exc:
+        logger.warning("RPCS pre-dispatch planning failed: %s", exc)
+        return str(exc)
+
+
+def _rpcs_resolve_prompt(session: dict) -> dict | None:
+    """Persist the exact live route and return the resolved display contract."""
+    planned = session.pop("_rpcs_dispatch", None)
+    cfg = session.get("_rpcs_gate_config")
+    if not planned or cfg is None:
+        return None
+    from .rpcs_gate import credential_fingerprint, resolve_dispatch
+
+    agent = session["agent"]
+    info = _session_info(agent, session)
+    api_mode = str(getattr(agent, "api_mode", "") or "").strip()
+    raw_provider = str(info.get("provider") or "unknown")
+    runtime = api_mode.replace("_", "-") or (
+        "codex-app-server" if raw_provider == "openai-codex" else "hermes-native"
+    )
+    provider = (
+        "openai"
+        if raw_provider == "openai-codex" and runtime == "codex-app-server"
+        else raw_provider
+    )
+    raw_credential = getattr(agent, "api_key", None)
+    route = {
+        "profile": str(planned.get("profile") or ""),
+        "runtime": runtime,
+        "provider": provider,
+        "model": str(info.get("model") or "unknown"),
+        "reasoning_effort": str(info.get("reasoning_effort") or "default"),
+        "credential_alias": f"{provider}-default",
+    }
+    fingerprint = credential_fingerprint(
+        raw_credential if isinstance(raw_credential, str) else None
+    )
+    if fingerprint:
+        route["credential_fingerprint"] = fingerprint
+    return resolve_dispatch(cfg, str(planned["dispatch_id"]), route)
 
 
 def _run_prompt_submit(
