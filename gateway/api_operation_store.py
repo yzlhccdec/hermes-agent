@@ -239,6 +239,74 @@ class OperationStore:
             )
         return PreparedOperation(operation_id, validation_object_id, "completed", False), status
 
+    def mutate_worker_task(
+        self, *, operation_id: str, actor_id: str, request_hash: str,
+        profile: str, spec_hash: str, task_id: str, action: str,
+        payload: dict[str, Any],
+    ) -> tuple[PreparedOperation, dict[str, Any]]:
+        """Atomically complete or block exactly one control-bound worker task."""
+        from hermes_cli import kanban_db as kb
+
+        if action not in {"complete", "block"}:
+            raise ValueError("unsupported worker action")
+        endpoint_kind = f"kanban.tasks.{action}"
+        binding = (actor_id, endpoint_kind, request_hash, profile, spec_hash)
+        timestamp = time.time()
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT * FROM api_operations WHERE operation_id=?", (operation_id,)
+            ).fetchone()
+            if row is not None:
+                existing = tuple(row[key] for key in (
+                    "actor_id", "endpoint_kind", "request_hash", "profile", "spec_hash"
+                ))
+                if existing != binding or row["object_id"] != task_id:
+                    raise OperationConflict(operation_id)
+                status = json.loads(row["status_json"])
+                return PreparedOperation(operation_id, task_id, row["state"], True), status
+            task = kb.get_task(self._conn, task_id)
+            if task is None or task.tenant != actor_id or task.assignee != profile:
+                raise ValueError("worker task not found")
+            try:
+                task_body = json.loads(task.body or "{}")
+            except json.JSONDecodeError as exc:
+                raise ValueError("invalid worker task") from exc
+            if task_body.get("spec_hash") != spec_hash or payload.get("spec_hash") != spec_hash:
+                raise ValueError("worker task binding mismatch")
+            if action == "complete":
+                if not payload.get("capsule_sha256"):
+                    raise ValueError("capsule_sha256 is required")
+                changed = kb.complete_task(
+                    self._conn, task_id, result="capsule submitted",
+                    summary=payload.get("summary") or "RPCS worker completed",
+                    metadata={"rpcs_attempt_id": payload.get("attempt_id"),
+                              "capsule_sha256": payload["capsule_sha256"],
+                              "spec_hash": spec_hash}, fire_lifecycle_hook=False,
+                )
+                state = "completed"
+            else:
+                reason = payload.get("reason")
+                kind = payload.get("kind")
+                if not isinstance(reason, str) or not reason.strip():
+                    raise ValueError("block reason is required")
+                changed = kb.block_task(self._conn, task_id, reason=reason.strip(), kind=kind)
+                state = "blocked"
+            if not changed:
+                raise ValueError(f"worker task is not {action}able")
+            status = {"object": "hermes.kanban.worker_task", "task_id": task_id,
+                      "status": state, "spec_hash": spec_hash,
+                      "attempt_id": payload.get("attempt_id")}
+            self._conn.execute(
+                """INSERT INTO api_operations
+                   (operation_id, actor_id, endpoint_kind, request_hash, profile,
+                    spec_hash, object_id, state, status_json, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'completed', ?, ?, ?)""",
+                (*((operation_id,) + binding + (task_id,)),
+                 json.dumps(status, sort_keys=True, separators=(",", ":")),
+                 timestamp, timestamp),
+            )
+        return PreparedOperation(operation_id, task_id, "completed", False), status
+
     def prepare(
         self, *, operation_id: str, actor_id: str, endpoint_kind: str,
         request_hash: str, profile: str, spec_hash: str, object_id: str,
