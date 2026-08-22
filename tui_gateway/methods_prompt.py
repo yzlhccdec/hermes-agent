@@ -822,7 +822,7 @@ def _(rid, params: dict) -> dict:
             if resolved_dispatch:
                 from .rpcs_gate import route_markdown
 
-                _emit("message.interim", sid, {"content": route_markdown(resolved_dispatch)})
+                _emit("message.interim", sid, {"text": route_markdown(resolved_dispatch)})
                 _emit("session.info", sid, {
                     **_session_info(session.get("agent"), session),
                     "rpcs_route": resolved_dispatch.get("display") or resolved_dispatch,

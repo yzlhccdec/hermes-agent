@@ -8196,7 +8196,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         if queued_resolved:
             from .rpcs_gate import route_markdown
 
-            _emit("message.interim", sid, {"content": route_markdown(queued_resolved)})
+            _emit("message.interim", sid, {"text": route_markdown(queued_resolved)})
             _emit("session.info", sid, {
                 **_session_info(session.get("agent"), session),
                 "rpcs_route": queued_resolved.get("display") or queued_resolved,
