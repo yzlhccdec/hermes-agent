@@ -4836,6 +4836,10 @@ class APIServerAdapter(BasePlatformAdapter):
             conversation_history_snapshot: Optional[List[Dict[str, Any]]] = None,
             session_id_snapshot: Optional[str] = None,
         ) -> None:
+            # Durable RPCS operations are updated even when the caller opted
+            # out of the ordinary Responses store.  The operation ledger is
+            # the recovery authority for the stable object and dispatch.
+            self._operation_store.update_status(response_id, response_env)
             if not store:
                 return
             if conversation_history_snapshot is None:
@@ -5321,6 +5325,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "output_tokens": usage.get("output_tokens", 0),
                     "total_tokens": usage.get("total_tokens", 0),
                 }
+                self._operation_store.update_status(response_id, failed_env)
                 await _write_event("response.failed", {
                     "type": "response.failed",
                     "response": failed_env,
@@ -5356,6 +5361,29 @@ class APIServerAdapter(BasePlatformAdapter):
         raw_input = body.get("input")
         if raw_input is None:
             return web.json_response(_openai_error("Missing 'input' field"), status=400)
+
+        operation_id = request.headers.get("X-RPCS-Operation-Id")
+        actor_id = request.headers.get("X-RPCS-Actor-Id")
+        supplied_hash = request.headers.get("X-RPCS-Request-Hash")
+        spec_hash = request.headers.get("X-RPCS-Spec-Hash")
+        operation_headers = (operation_id, actor_id, supplied_hash, spec_hash)
+        if any(operation_headers) and not all(operation_headers):
+            return web.json_response(
+                _openai_error(
+                    "X-RPCS-Operation-Id, X-RPCS-Actor-Id, "
+                    "X-RPCS-Request-Hash and X-RPCS-Spec-Hash must be supplied together",
+                    code="invalid_operation_binding",
+                ),
+                status=400,
+            )
+        request_hash = hashlib.sha256(
+            json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        ).hexdigest()
+        if supplied_hash and not hmac.compare_digest(supplied_hash, request_hash):
+            return web.json_response(
+                _openai_error("Canonical request hash mismatch", code="request_hash_mismatch"),
+                status=400,
+            )
 
         instructions = body.get("instructions")
         previous_response_id = body.get("previous_response_id")
@@ -5459,6 +5487,52 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
+
+        response_id = f"resp_{uuid.uuid4().hex[:28]}"
+        created_at = int(time.time())
+        if operation_id:
+            initial_status = {
+                "id": response_id,
+                "object": "response",
+                "status": "queued",
+                "created_at": created_at,
+                "model": body.get("model", self._model_name),
+            }
+            try:
+                prepared_operation = self._operation_store.prepare(
+                    operation_id=operation_id,
+                    actor_id=actor_id,
+                    endpoint_kind="responses.create",
+                    request_hash=request_hash,
+                    profile=_api_request_profile.get() or "default",
+                    spec_hash=spec_hash,
+                    object_id=response_id,
+                    initial_status=initial_status,
+                )
+            except OperationConflict:
+                return web.json_response(
+                    _openai_error(
+                        "Operation id is already bound to a different request",
+                        code="operation_conflict",
+                    ),
+                    status=409,
+                )
+            response_id = prepared_operation.object_id
+            if prepared_operation.replayed and prepared_operation.state != "queued":
+                stored_response = self._response_store.get(response_id)
+                if stored_response is not None and prepared_operation.state in {
+                    "completed", "failed", "incomplete"
+                }:
+                    return web.json_response(stored_response["response"])
+                return web.json_response(
+                    _openai_error("Operation is already running", code="operation_in_progress"),
+                    status=409,
+                )
+            if not self._operation_store.claim_dispatch(operation_id):
+                return web.json_response(
+                    _openai_error("Operation is already running", code="operation_in_progress"),
+                    status=409,
+                )
         if stream:
             # Streaming branch — emit OpenAI Responses SSE events as the
             # agent runs so frontends can render text deltas and tool
@@ -5519,9 +5593,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # agent_task.done(), which can race with queue timeout checks.
             agent_task.add_done_callback(lambda _fut: _stream_q.put_nowait(None))
 
-            response_id = f"resp_{uuid.uuid4().hex[:28]}"
             model_name = body.get("model", self._model_name)
-            created_at = int(time.time())
 
             return await self._write_sse_responses(
                 request=request,
@@ -5588,9 +5660,6 @@ class APIServerAdapter(BasePlatformAdapter):
         if not final_response:
             final_response = _redact_api_error_text(result.get("error", "(No response generated)"))
 
-        response_id = f"resp_{uuid.uuid4().hex[:28]}"
-        created_at = int(time.time())
-
         # Build the full conversation history for storage
         # (includes tool calls from the agent run)
         full_history = self._build_response_conversation_history(
@@ -5633,6 +5702,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "total_tokens": usage.get("total_tokens", 0),
             },
         }
+        if operation_id:
+            self._operation_store.update_status(response_id, response_data)
 
         # Store the complete response object for future chaining / GET retrieval
         if store:

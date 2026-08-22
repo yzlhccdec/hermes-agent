@@ -13,6 +13,7 @@ Tests cover:
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import stat
@@ -288,13 +289,15 @@ class TestConcurrencyCap:
 # ---------------------------------------------------------------------------
 
 
-def _make_adapter(api_key: str = "", cors_origins=None) -> APIServerAdapter:
+def _make_adapter(api_key: str = "", cors_origins=None, operation_db_path: str = "") -> APIServerAdapter:
     """Create an adapter with optional API key."""
     extra = {}
     if api_key:
         extra["key"] = api_key
     if cors_origins is not None:
         extra["cors_origins"] = cors_origins
+    if operation_db_path:
+        extra["operation_db_path"] = operation_db_path
     config = PlatformConfig(enabled=True, extra=extra)
     return APIServerAdapter(config)
 
@@ -1317,6 +1320,50 @@ class TestDeriveChatSessionId:
 
 
 class TestResponsesEndpoint:
+
+    @pytest.mark.asyncio
+    async def test_durable_operation_reuses_stable_response_without_redispatch(self, tmp_path):
+        adapter = _make_adapter(operation_db_path=str(tmp_path / "operations.db"))
+        app = _create_app(adapter)
+        body = {"model": "hermes-agent", "input": "hello"}
+        request_hash = hashlib.sha256(
+            json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        ).hexdigest()
+        headers = {
+            "X-RPCS-Operation-Id": "op_response_1",
+            "X-RPCS-Actor-Id": "actor_test",
+            "X-RPCS-Request-Hash": request_hash,
+            "X-RPCS-Spec-Hash": "none",
+        }
+        result = {"final_response": "done", "messages": [], "api_calls": 1}
+        usage = {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (result, usage)
+                first = await cli.post("/v1/responses", json=body, headers=headers)
+                replay = await cli.post("/v1/responses", json=body, headers=headers)
+
+            assert first.status == 200
+            assert replay.status == 200
+            first_data = await first.json()
+            replay_data = await replay.json()
+            assert replay_data["id"] == first_data["id"]
+            assert mock_run.await_count == 1
+            operation = adapter._operation_store.get_by_operation("op_response_1")
+            assert operation["object_id"] == first_data["id"]
+            assert operation["state"] == "completed"
+
+            changed = {**body, "input": "changed"}
+            changed_hash = hashlib.sha256(
+                json.dumps(changed, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+            ).hexdigest()
+            conflict = await cli.post(
+                "/v1/responses",
+                json=changed,
+                headers={**headers, "X-RPCS-Request-Hash": changed_hash},
+            )
+            assert conflict.status == 409
 
 
     @pytest.mark.asyncio
