@@ -32,11 +32,11 @@ class OperationStore:
     second in-process dispatch.
     """
 
-    def __init__(self, db_path: str | Path):
+    def __init__(self, db_path: str | Path, *, connection=None):
         path = Path(db_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(str(path), check_same_thread=False)
+        self._conn = connection or sqlite3.connect(str(path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=FULL")
@@ -58,6 +58,58 @@ class OperationStore:
             """
         )
         self._conn.commit()
+
+    def prepare_kanban_root(
+        self, *, operation_id: str, actor_id: str, request_hash: str,
+        profile: str, spec_hash: str, title: str, body: str,
+    ) -> PreparedOperation:
+        """Atomically create a blocked Kanban root and its operation binding.
+
+        The connection must point at the active Kanban database.  ``create_task``
+        uses a nested savepoint, so the task row/event and operation ledger row
+        commit or roll back together under this outer transaction.
+        """
+        from hermes_cli import kanban_db as kb
+
+        endpoint_kind = "kanban.roots.create"
+        binding = (actor_id, endpoint_kind, request_hash, profile, spec_hash)
+        now = time.time()
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT * FROM api_operations WHERE operation_id = ?", (operation_id,)
+            ).fetchone()
+            if row is not None:
+                existing = tuple(row[key] for key in (
+                    "actor_id", "endpoint_kind", "request_hash", "profile", "spec_hash"
+                ))
+                if existing != binding:
+                    raise OperationConflict(operation_id)
+                return PreparedOperation(operation_id, row["object_id"], row["state"], True)
+            task_id = kb.create_task(
+                self._conn,
+                title=title,
+                body=body,
+                assignee=None,
+                created_by="rpcs-control",
+                tenant=actor_id,
+                idempotency_key=operation_id,
+                initial_status="blocked",
+            )
+            status = {
+                "object": "hermes.kanban.root",
+                "task_id": task_id,
+                "status": "blocked",
+                "spec_hash": spec_hash,
+            }
+            self._conn.execute(
+                """INSERT INTO api_operations
+                   (operation_id, actor_id, endpoint_kind, request_hash, profile,
+                    spec_hash, object_id, state, status_json, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'completed', ?, ?, ?)""",
+                (*((operation_id,) + binding + (task_id,)),
+                 json.dumps(status, sort_keys=True, separators=(",", ":")), now, now),
+            )
+        return PreparedOperation(operation_id, task_id, "completed", False)
 
     def prepare(
         self, *, operation_id: str, actor_id: str, endpoint_kind: str,

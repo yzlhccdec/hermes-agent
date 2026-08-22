@@ -1425,7 +1425,16 @@ class APIServerAdapter(BasePlatformAdapter):
             from hermes_constants import get_hermes_home
 
             operation_db_path = str(get_hermes_home() / "api_operations.db")
-        self._operation_store = OperationStore(operation_db_path)
+        # RPCS durable Kanban roots must share one SQLite transaction with
+        # their operation binding.  Initialising the Kanban schema in the
+        # existing operation DB preserves prior Run/Response ledger rows while
+        # making that same file the active board when HERMES_KANBAN_DB points
+        # at it in the deployment.
+        from hermes_cli import kanban_db as _rpcs_kanban_db
+        _operation_conn = _rpcs_kanban_db.connect(Path(operation_db_path))
+        self._operation_store = OperationStore(
+            operation_db_path, connection=_operation_conn,
+        )
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
         # Creation timestamps for orphaned-run TTL sweep
@@ -2100,6 +2109,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
             ("POST", "/v1/runs", self._handle_runs),
             ("GET", "/internal/operations/{operation_id}", self._handle_get_operation),
+            ("POST", "/internal/kanban/roots", self._handle_create_kanban_root),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
@@ -7243,6 +7253,57 @@ class APIServerAdapter(BasePlatformAdapter):
                 _openai_error("Operation not found", code="operation_not_found"), status=404
             )
         return web.json_response(operation)
+
+    async def _handle_create_kanban_root(self, request: "web.Request") -> "web.Response":
+        """Create one blocked Kanban root in the operation ledger transaction."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        operation_id = request.headers.get("X-RPCS-Operation-Id")
+        actor_id = request.headers.get("X-RPCS-Actor-Id")
+        supplied_hash = request.headers.get("X-RPCS-Request-Hash")
+        spec_hash = request.headers.get("X-RPCS-Spec-Hash")
+        if not all((operation_id, actor_id, supplied_hash, spec_hash)):
+            return web.json_response(
+                _openai_error("Complete RPCS operation binding is required", code="invalid_operation_binding"),
+                status=400,
+            )
+        title = body.get("title")
+        if not isinstance(title, str) or not title.strip():
+            return web.json_response(_openai_error("title is required"), status=400)
+        if body.get("spec_hash") != spec_hash:
+            return web.json_response(_openai_error("spec_hash mismatch"), status=400)
+        request_hash = hashlib.sha256(
+            json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        ).hexdigest()
+        if not hmac.compare_digest(supplied_hash, request_hash):
+            return web.json_response(
+                _openai_error("Canonical request hash mismatch", code="request_hash_mismatch"),
+                status=400,
+            )
+        try:
+            prepared = self._operation_store.prepare_kanban_root(
+                operation_id=operation_id,
+                actor_id=actor_id,
+                request_hash=request_hash,
+                profile=_api_request_profile.get() or "default",
+                spec_hash=spec_hash,
+                title=title,
+                body=json.dumps(body.get("spec", {}), sort_keys=True, ensure_ascii=False),
+            )
+        except OperationConflict:
+            return web.json_response(
+                _openai_error("Operation id is already bound to a different request", code="operation_conflict"),
+                status=409,
+            )
+        return web.json_response(
+            {"task_id": prepared.object_id, "status": "blocked", "replayed": prepared.replayed},
+            status=200 if prepared.replayed else 201,
+        )
 
     async def _handle_get_run(self, request: "web.Request") -> "web.Response":
         """GET /v1/runs/{run_id} — return pollable run status for external UIs."""

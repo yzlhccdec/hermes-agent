@@ -14,6 +14,7 @@ import hashlib
 import json
 import threading
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -72,6 +73,7 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app["api_server_adapter"] = adapter
     app.router.add_post("/v1/runs", adapter._handle_runs)
     app.router.add_get("/internal/operations/{operation_id}", adapter._handle_get_operation)
+    app.router.add_post("/internal/kanban/roots", adapter._handle_create_kanban_root)
     app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
     app.router.add_post("/v1/runs/{run_id}/approval", adapter._handle_run_approval)
@@ -127,6 +129,49 @@ def auth_adapter():
 
 
 class TestStartRun:
+    @pytest.mark.asyncio
+    async def test_kanban_root_and_operation_are_atomic_and_replayed(self, tmp_path):
+        db_path = str(tmp_path / "operations.db")
+        adapter = _make_adapter(operation_db_path=db_path)
+        app = _create_runs_app(adapter)
+        body = {"title": "Implement frozen spec", "spec_hash": "spec_hash_1", "spec": {"goal": "ship"}}
+        digest = hashlib.sha256(
+            json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        ).hexdigest()
+        headers = {
+            "X-RPCS-Operation-Id": "spec:spec_1:1:root",
+            "X-RPCS-Actor-Id": "actor_test",
+            "X-RPCS-Request-Hash": digest,
+            "X-RPCS-Spec-Hash": "spec_hash_1",
+        }
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.post("/internal/kanban/roots", json=body, headers=headers)
+            replay = await cli.post("/internal/kanban/roots", json=body, headers=headers)
+            assert first.status == 201
+            assert replay.status == 200
+            first_data = await first.json()
+            assert (await replay.json())["task_id"] == first_data["task_id"]
+
+            from hermes_cli import kanban_db as kb
+            with kb.connect_closing(db_path=Path(db_path)) as conn:
+                task = kb.get_task(conn, first_data["task_id"])
+                assert task.status == "blocked"
+                assert task.tenant == "actor_test"
+                assert conn.execute(
+                    "SELECT COUNT(*) FROM api_operations WHERE operation_id=?",
+                    ("spec:spec_1:1:root",),
+                ).fetchone()[0] == 1
+
+            changed = {**body, "title": "changed"}
+            changed_digest = hashlib.sha256(
+                json.dumps(changed, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+            ).hexdigest()
+            conflict = await cli.post(
+                "/internal/kanban/roots", json=changed,
+                headers={**headers, "X-RPCS-Request-Hash": changed_digest},
+            )
+            assert conflict.status == 409
+
     @pytest.mark.asyncio
     async def test_durable_operation_replay_and_conflict(self, tmp_path):
         adapter = _make_adapter(operation_db_path=str(tmp_path / "operations.db"))
