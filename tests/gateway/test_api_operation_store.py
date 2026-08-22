@@ -71,6 +71,19 @@ def test_worker_mutation_is_bound_atomic_and_replayed(tmp_path):
     replay, _ = store.mutate_worker_task(**kwargs)
     assert replay.replayed is True
 
+    recovered_id = kb.create_task(
+        conn, title="recovered", body=json.dumps({"spec_hash": "spec_1"}),
+        assignee="codex-standard", created_by="rpcs-control", tenant="actor_1",
+        initial_status="running",
+    )
+    assert kb.block_task(conn, recovered_id, reason="already blocked", kind="transient")
+    recovered, recovered_status = store.mutate_worker_task(
+        **{**kwargs, "operation_id": "worker-block:recovered", "task_id": recovered_id,
+           "action": "block", "payload": {"attempt_id": "recovered", "spec_hash": "spec_1",
+                                                 "reason": "already blocked", "kind": "transient"}})
+    assert recovered.replayed is False
+    assert recovered_status["status"] == "blocked"
+
     foreign_id = kb.create_task(
         conn, title="foreign", body=json.dumps({"spec_hash": "spec_1"}),
         assignee="codex-standard", created_by="rpcs-control", tenant="actor_2",

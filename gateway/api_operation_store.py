@@ -292,7 +292,14 @@ class OperationStore:
                 changed = kb.block_task(self._conn, task_id, reason=reason.strip(), kind=kind)
                 state = "blocked"
             if not changed:
-                raise ValueError(f"worker task is not {action}able")
+                # kanban_db lifecycle helpers may commit their state transition
+                # before an API-ledger write is interrupted.  Converge only
+                # when the same bound task already reached the requested class.
+                current = kb.get_task(self._conn, task_id)
+                terminal = ({"done"} if action == "complete"
+                            else {"blocked", "todo", "triage"})
+                if current is None or current.status not in terminal:
+                    raise ValueError(f"worker task is not {action}able")
             status = {"object": "hermes.kanban.worker_task", "task_id": task_id,
                       "status": state, "spec_hash": spec_hash,
                       "attempt_id": payload.get("attempt_id")}
