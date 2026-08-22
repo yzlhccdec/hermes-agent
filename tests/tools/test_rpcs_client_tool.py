@@ -17,7 +17,9 @@ def test_rpcs_client_tool_waits_for_cli_and_returns_asset(monkeypatch):
     ])
     monkeypatch.setattr(rpcs_client_tool, "_request", lambda *args, **kwargs: next(replies))
     monkeypatch.setattr(rpcs_client_tool.time, "sleep", lambda _seconds: None)
-    result = json.loads(rpcs_client_tool.request_ssh_host_onboarding("prod", "10.0.0.8"))
+    result = json.loads(rpcs_client_tool.request_ssh_host_onboarding(
+        "prod", "10.0.0.8", "cli_1"
+    ))
     assert result["asset_id"] == "host_1"
     assert result["success"] is True
 

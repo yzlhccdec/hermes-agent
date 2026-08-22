@@ -43,11 +43,14 @@ def _request(method: str, path: str, payload=None) -> dict:
     return result
 
 
-def request_ssh_host_onboarding(alias: str, host: str, port=22, bootstrap_user="root") -> str:
+def request_ssh_host_onboarding(
+    alias: str, host: str, client_id: str, port=22, bootstrap_user="root"
+) -> str:
     """Wait for the connected RPCS CLI to onboard an existing SSH server."""
     try:
         action = _request("POST", "/internal/client-actions/ssh-host-onboarding", {
             "project_id": os.environ["RPCS_PROJECT_ID"],
+            "client_id": client_id,
             "alias": alias,
             "host": host,
             "port": int(port),
@@ -97,8 +100,15 @@ RPCS_SSH_ONBOARD_SCHEMA = {
                 "description": "Existing SSH login user available through the local SSH config/agent.",
                 "default": "root",
             },
+            "client_id": {
+                "type": "string",
+                "description": (
+                    "Opaque client binding supplied by the RPCS system instruction. Copy it exactly; "
+                    "never invent or reuse a value from another conversation."
+                ),
+            },
         },
-        "required": ["alias", "host"],
+        "required": ["alias", "host", "client_id"],
     },
 }
 
@@ -110,6 +120,7 @@ registry.register(
     handler=lambda args, **kw: request_ssh_host_onboarding(
         alias=args.get("alias", ""),
         host=args.get("host", ""),
+        client_id=args.get("client_id", ""),
         port=args.get("port", 22),
         bootstrap_user=args.get("bootstrap_user", "root"),
     ),
