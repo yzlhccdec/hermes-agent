@@ -5,6 +5,12 @@ from unittest.mock import MagicMock, patch
 
 from gateway.config import Platform
 from gateway.run import GatewayRunner
+from gateway.kanban_watchers import _kanban_dispatch_allowed
+
+
+def test_rpcs_env_disables_stock_db_backed_dispatch(monkeypatch):
+    monkeypatch.setenv("RPCS_DISABLE_STOCK_KANBAN_DISPATCH", "1")
+    assert _kanban_dispatch_allowed() is False
 
 
 def _make_runner(with_adapter=False):

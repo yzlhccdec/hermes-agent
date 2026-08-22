@@ -66,6 +66,10 @@ def _kanban_dispatch_allowed() -> bool:
     module is unimportable, dispatch proceeds (the sentinel gate must not
     become a new crash surface for the dispatcher).
     """
+    if os.environ.get("RPCS_DISABLE_STOCK_KANBAN_DISPATCH", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }:
+        return False
     try:
         from agent.estop import check_paused
     except ImportError:
