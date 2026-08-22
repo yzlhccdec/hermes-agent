@@ -12,7 +12,7 @@ from tools.registry import registry, tool_error
 
 def check_rpcs_client_requirements() -> bool:
     return all(os.environ.get(name, "").strip() for name in (
-        "RPCS_CONTROL_URL", "RPCS_HERMES_INGRESS_KEY", "RPCS_ACTOR_ID", "RPCS_PROJECT_ID"
+        "RPCS_CONTROL_URL", "RPCS_HERMES_INGRESS_KEY", "RPCS_ACTOR_ID"
     ))
 
 
@@ -44,12 +44,12 @@ def _request(method: str, path: str, payload=None) -> dict:
 
 
 def request_ssh_host_onboarding(
-    alias: str, host: str, client_id: str, port=22, bootstrap_user="root"
+    alias: str, host: str, project_id: str, client_id: str, port=22, bootstrap_user="root"
 ) -> str:
     """Wait for the connected RPCS CLI to onboard an existing SSH server."""
     try:
         action = _request("POST", "/internal/client-actions/ssh-host-onboarding", {
-            "project_id": os.environ["RPCS_PROJECT_ID"],
+            "project_id": project_id,
             "client_id": client_id,
             "alias": alias,
             "host": host,
@@ -107,8 +107,12 @@ RPCS_SSH_ONBOARD_SCHEMA = {
                     "never invent or reuse a value from another conversation."
                 ),
             },
+            "project_id": {
+                "type": "string",
+                "description": "Project binding supplied by the RPCS system instruction. Copy it exactly.",
+            },
         },
-        "required": ["alias", "host", "client_id"],
+        "required": ["alias", "host", "project_id", "client_id"],
     },
 }
 
@@ -120,6 +124,7 @@ registry.register(
     handler=lambda args, **kw: request_ssh_host_onboarding(
         alias=args.get("alias", ""),
         host=args.get("host", ""),
+        project_id=args.get("project_id", ""),
         client_id=args.get("client_id", ""),
         port=args.get("port", 22),
         bootstrap_user=args.get("bootstrap_user", "root"),
