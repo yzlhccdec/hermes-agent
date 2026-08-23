@@ -5,6 +5,7 @@ import pytest
 
 from tui_gateway.rpcs_gate import (
     RPCSGateError,
+    interactive_route,
     load_gate_config,
     plan_dispatch,
     resolve_dispatch,
@@ -88,3 +89,16 @@ def test_enabled_gate_fails_closed_without_secret(monkeypatch):
         plan_dispatch(
             cfg, surface="hermes-native", surface_session_id="ui-1", turn_id="rpc-1", text="hi"
         )
+
+
+def test_interactive_route_requires_truthful_hermes_runtime():
+    route = interactive_route({"route": {
+        "runtime": "hermes-loop", "provider": "openai-codex", "model": "gpt-5.4",
+        "reasoning_effort": "high",
+    }})
+    assert route["provider"] == "openai-codex"
+    with pytest.raises(RPCSGateError, match="requires hermes-loop"):
+        interactive_route({"route": {
+            "runtime": "codex-app-server", "provider": "openai-codex", "model": "gpt-5.4",
+            "reasoning_effort": "high",
+        }})

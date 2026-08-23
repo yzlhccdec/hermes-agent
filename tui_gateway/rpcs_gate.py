@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -13,6 +14,9 @@ from typing import Any
 
 class RPCSGateError(RuntimeError):
     pass
+
+
+_ROUTE_VALUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,191}$")
 
 
 @dataclass(frozen=True)
@@ -109,6 +113,22 @@ def credential_fingerprint(value: str | None) -> str | None:
     if not value:
         return None
     return hashlib.sha256(value.encode()).hexdigest()[:16]
+
+
+def interactive_route(dispatch: dict[str, Any]) -> dict[str, str]:
+    """Return a validated route that Hermes can apply to an interactive turn."""
+    route = dispatch.get("route") if isinstance(dispatch, dict) else None
+    if not isinstance(route, dict):
+        raise RPCSGateError("RPCS planned dispatch has no route")
+    required = ("runtime", "provider", "model", "reasoning_effort")
+    values = {key: str(route.get(key) or "").strip() for key in required}
+    if any(not _ROUTE_VALUE.fullmatch(value) for value in values.values()):
+        raise RPCSGateError("RPCS planned dispatch contains an invalid route value")
+    if values["runtime"] != "hermes-loop":
+        raise RPCSGateError(
+            f"RPCS interactive dispatch requires hermes-loop, got {values['runtime']}"
+        )
+    return values
 
 
 def route_markdown(dispatch: dict[str, Any]) -> str:

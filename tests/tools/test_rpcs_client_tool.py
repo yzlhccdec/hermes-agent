@@ -38,5 +38,20 @@ def test_rpcs_client_tool_is_hidden_without_bridge_configuration(monkeypatch):
     assert rpcs_client_tool.check_rpcs_client_requirements() is False
 
 
+def test_rpcs_client_tool_uses_native_tui_environment_binding(monkeypatch):
+    monkeypatch.setenv("RPCS_PROJECT_ID", "project-native")
+    monkeypatch.setenv("RPCS_CLIENT_ID", "cli-native")
+    seen = {}
+
+    def fake_request(_method, _path, payload=None):
+        seen.update(payload or {})
+        return {"action_id": "action_1", "state": "failed", "error": "stop"}
+
+    monkeypatch.setattr(rpcs_client_tool, "_request", fake_request)
+    rpcs_client_tool.request_ssh_host_onboarding("prod", "10.0.0.8")
+    assert seen["project_id"] == "project-native"
+    assert seen["client_id"] == "cli-native"
+
+
 def test_rpcs_client_tool_is_core_and_never_deferred():
     assert is_deferrable_tool_name("rpcs_onboard_ssh_host") is False

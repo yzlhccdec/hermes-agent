@@ -8192,6 +8192,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             raise RuntimeError(
                 "RPCS managed dispatch does not yet support dashboard.turn_isolation"
             )
+        _rpcs_apply_prompt_route(sid, session)
         queued_resolved = _rpcs_resolve_prompt(session)
         if queued_resolved:
             from .rpcs_gate import route_markdown
@@ -10513,6 +10514,39 @@ def _rpcs_plan_prompt(rid, sid: str, session: dict, text: str) -> str | None:
         return str(exc)
 
 
+def _rpcs_apply_prompt_route(sid: str, session: dict) -> None:
+    """Apply the Control-selected route to the live agent before the turn starts."""
+    planned = session.get("_rpcs_dispatch")
+    if not planned:
+        return
+    from hermes_constants import parse_reasoning_effort
+    from .rpcs_gate import RPCSGateError, interactive_route
+
+    route = interactive_route(planned)
+    agent = session.get("agent")
+    if agent is None:
+        raise RPCSGateError("Hermes agent is not ready for RPCS route application")
+    current_model = str(getattr(agent, "model", "") or "")
+    current_provider = str(getattr(agent, "provider", "") or "")
+    if current_model != route["model"] or current_provider != route["provider"]:
+        _apply_model_switch(
+            sid,
+            session,
+            f"{route['model']} --provider {route['provider']}",
+            confirm_expensive_model=True,
+            pin_session_override=True,
+            persist_override=False,
+        )
+    reasoning = parse_reasoning_effort(route["reasoning_effort"])
+    if reasoning is None:
+        raise RPCSGateError(
+            f"RPCS selected unsupported reasoning effort {route['reasoning_effort']}"
+        )
+    session["create_reasoning_override"] = reasoning
+    agent.reasoning_config = reasoning
+    _persist_live_session_runtime(session)
+
+
 def _rpcs_resolve_prompt(session: dict) -> dict | None:
     """Persist the exact live route and return the resolved display contract."""
     planned = session.pop("_rpcs_dispatch", None)
@@ -10523,16 +10557,9 @@ def _rpcs_resolve_prompt(session: dict) -> dict | None:
 
     agent = session["agent"]
     info = _session_info(agent, session)
-    api_mode = str(getattr(agent, "api_mode", "") or "").strip()
     raw_provider = str(info.get("provider") or "unknown")
-    runtime = api_mode.replace("_", "-") or (
-        "codex-app-server" if raw_provider == "openai-codex" else "hermes-native"
-    )
-    provider = (
-        "openai"
-        if raw_provider == "openai-codex" and runtime == "codex-app-server"
-        else raw_provider
-    )
+    runtime = "hermes-loop"
+    provider = raw_provider
     raw_credential = getattr(agent, "api_key", None)
     route = {
         "profile": str(planned.get("profile") or ""),

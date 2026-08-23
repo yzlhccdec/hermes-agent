@@ -44,10 +44,15 @@ def _request(method: str, path: str, payload=None) -> dict:
 
 
 def request_ssh_host_onboarding(
-    alias: str, host: str, project_id: str, client_id: str, port=22, bootstrap_user="root"
+    alias: str, host: str, project_id: str = "", client_id: str = "", port=22,
+    bootstrap_user="root"
 ) -> str:
     """Wait for the connected RPCS CLI to onboard an existing SSH server."""
     try:
+        project_id = project_id.strip() or os.environ.get("RPCS_PROJECT_ID", "").strip()
+        client_id = client_id.strip() or os.environ.get("RPCS_CLIENT_ID", "").strip()
+        if not project_id or not client_id:
+            raise RuntimeError("RPCS CLI project/client binding is unavailable")
         action = _request("POST", "/internal/client-actions/ssh-host-onboarding", {
             "project_id": project_id,
             "client_id": client_id,
@@ -103,16 +108,15 @@ RPCS_SSH_ONBOARD_SCHEMA = {
             "client_id": {
                 "type": "string",
                 "description": (
-                    "Opaque client binding supplied by the RPCS system instruction. Copy it exactly; "
-                    "never invent or reuse a value from another conversation."
+                    "Optional opaque client binding. Omit it when RPCS launched this TUI."
                 ),
             },
             "project_id": {
                 "type": "string",
-                "description": "Project binding supplied by the RPCS system instruction. Copy it exactly.",
+                "description": "Optional project binding. Omit it when RPCS launched this TUI.",
             },
         },
-        "required": ["alias", "host", "project_id", "client_id"],
+        "required": ["alias", "host"],
     },
 }
 

@@ -818,6 +818,7 @@ def _(rid, params: dict) -> dict:
                 )
                 return
         try:
+            _rpcs_apply_prompt_route(sid, session)
             resolved_dispatch = _rpcs_resolve_prompt(session)
             if resolved_dispatch:
                 from .rpcs_gate import route_markdown
