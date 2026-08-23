@@ -10,8 +10,11 @@ Covers:
 """
 
 import asyncio
+import hashlib
+import json
 import threading
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -51,11 +54,13 @@ def test_approval_event_choices_follow_backend_capabilities(
     ) == expected
 
 
-def _make_adapter(api_key: str = "") -> APIServerAdapter:
+def _make_adapter(api_key: str = "", operation_db_path: str = "") -> APIServerAdapter:
     """Create an adapter with optional API key."""
     extra = {}
     if api_key:
         extra["key"] = api_key
+    if operation_db_path:
+        extra["operation_db_path"] = operation_db_path
     config = PlatformConfig(enabled=True, extra=extra)
     adapter = APIServerAdapter(config)
     return adapter
@@ -67,6 +72,10 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app = web.Application(middlewares=mws)
     app["api_server_adapter"] = adapter
     app.router.add_post("/v1/runs", adapter._handle_runs)
+    app.router.add_get("/internal/operations/{operation_id}", adapter._handle_get_operation)
+    app.router.add_post("/internal/kanban/roots", adapter._handle_create_kanban_root)
+    app.router.add_post("/internal/kanban/graphs", adapter._handle_create_kanban_graph)
+    app.router.add_post("/internal/kanban/barriers/{task_id}/complete", adapter._handle_complete_barrier)
     app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
     app.router.add_post("/v1/runs/{run_id}/approval", adapter._handle_run_approval)
@@ -122,6 +131,162 @@ def auth_adapter():
 
 
 class TestStartRun:
+    @pytest.mark.asyncio
+    async def test_kanban_root_and_operation_are_atomic_and_replayed(self, tmp_path):
+        db_path = str(tmp_path / "operations.db")
+        adapter = _make_adapter(operation_db_path=db_path)
+        app = _create_runs_app(adapter)
+        body = {"title": "Implement frozen spec", "spec_hash": "spec_hash_1", "spec": {"goal": "ship"}}
+        digest = hashlib.sha256(
+            json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        ).hexdigest()
+        headers = {
+            "X-RPCS-Operation-Id": "spec:spec_1:1:root",
+            "X-RPCS-Actor-Id": "actor_test",
+            "X-RPCS-Request-Hash": digest,
+            "X-RPCS-Spec-Hash": "spec_hash_1",
+        }
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.post("/internal/kanban/roots", json=body, headers=headers)
+            replay = await cli.post("/internal/kanban/roots", json=body, headers=headers)
+            assert first.status == 201
+            assert replay.status == 200
+            first_data = await first.json()
+            assert (await replay.json())["task_id"] == first_data["task_id"]
+
+            from hermes_cli import kanban_db as kb
+            with kb.connect_closing(db_path=Path(db_path)) as conn:
+                task = kb.get_task(conn, first_data["task_id"])
+                assert task.status == "blocked"
+                assert task.tenant == "actor_test"
+                assert conn.execute(
+                    "SELECT COUNT(*) FROM api_operations WHERE operation_id=?",
+                    ("spec:spec_1:1:root",),
+                ).fetchone()[0] == 1
+
+            changed = {**body, "title": "changed"}
+            changed_digest = hashlib.sha256(
+                json.dumps(changed, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+            ).hexdigest()
+            conflict = await cli.post(
+                "/internal/kanban/roots", json=changed,
+                headers={**headers, "X-RPCS-Request-Hash": changed_digest},
+            )
+            assert conflict.status == 409
+
+    @pytest.mark.asyncio
+    async def test_graph_inserts_blocked_barriers_between_real_workers(self, tmp_path):
+        db_path = str(tmp_path / "operations.db")
+        adapter = _make_adapter(operation_db_path=db_path)
+        app = _create_runs_app(adapter)
+        root_body = {"title": "root", "spec_hash": "hash", "spec": {}}
+        def headers(operation_id, payload):
+            digest = hashlib.sha256(json.dumps(
+                payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            ).encode()).hexdigest()
+            return {"X-RPCS-Operation-Id": operation_id, "X-RPCS-Actor-Id": "actor",
+                    "X-RPCS-Request-Hash": digest, "X-RPCS-Spec-Hash": "hash"}
+        async with TestClient(TestServer(app)) as cli:
+            root_resp = await cli.post("/internal/kanban/roots", json=root_body,
+                                       headers=headers("spec:s:1:root", root_body))
+            root_id = (await root_resp.json())["task_id"]
+            graph_body = {"root_task_id": root_id, "spec_hash": "hash", "nodes": [
+                {"key": "a", "title": "A", "objective": "first", "profile": "codex-standard", "depends_on": []},
+                {"key": "b", "title": "B", "objective": "second", "profile": "codex-deep", "depends_on": ["a"]},
+                {"key": "c", "title": "C", "objective": "third", "profile": "memory-curator", "depends_on": ["b"]},
+            ]}
+            first = await cli.post("/internal/kanban/graphs", json=graph_body,
+                                   headers=headers("spec:s:1:graph", graph_body))
+            replay = await cli.post("/internal/kanban/graphs", json=graph_body,
+                                    headers=headers("spec:s:1:graph", graph_body))
+            assert first.status == 201 and replay.status == 200
+            data = await first.json()
+            assert (await replay.json())["graph_id"] == data["graph_id"]
+            from hermes_cli import kanban_db as kb
+            with kb.connect_closing(db_path=Path(db_path)) as conn:
+                assert kb.get_task(conn, data["tasks"]["a"]).status == "ready"
+                assert kb.get_task(conn, data["barriers"]["a"]).status == "blocked"
+                assert kb.get_task(conn, data["tasks"]["b"]).status == "todo"
+                links = {(row[0], row[1]) for row in conn.execute(
+                    "SELECT parent_id,child_id FROM task_links"
+                )}
+                assert (data["barriers"]["a"], data["tasks"]["b"]) in links
+                assert (data["barriers"]["c"], root_id) in links
+                assert kb.complete_task(conn, data["tasks"]["a"], result="worker capsule submitted")
+            validation_body = {"validation_id": "validation_1", "capsule_sha256": "a" * 64,
+                               "spec_hash": "hash", "checks": {"schema": True}, "verdict": "passed"}
+            completed = await cli.post(
+                f"/internal/kanban/barriers/{data['barriers']['a']}/complete",
+                json=validation_body,
+                headers=headers("validate:a", validation_body),
+            )
+            replayed = await cli.post(
+                f"/internal/kanban/barriers/{data['barriers']['a']}/complete",
+                json=validation_body,
+                headers=headers("validate:a", validation_body),
+            )
+            completed_text = await completed.text()
+            replayed_text = await replayed.text()
+            assert completed.status == 200 and replayed.status == 200, (completed_text, replayed_text)
+            with kb.connect_closing(db_path=Path(db_path)) as conn:
+                assert kb.get_task(conn, data["barriers"]["a"]).status == "done"
+                assert kb.get_task(conn, data["tasks"]["b"]).status == "ready"
+                assert conn.execute(
+                    "SELECT COUNT(*) FROM api_operations WHERE operation_id='validate:a'"
+                ).fetchone()[0] == 1
+
+    @pytest.mark.asyncio
+    async def test_durable_operation_replay_and_conflict(self, tmp_path):
+        adapter = _make_adapter(operation_db_path=str(tmp_path / "operations.db"))
+        app = _create_runs_app(adapter)
+        body = {"input": "hello"}
+
+        def headers(payload):
+            digest = hashlib.sha256(
+                json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+            ).hexdigest()
+            return {
+                "X-RPCS-Operation-Id": "op_test_1",
+                "X-RPCS-Actor-Id": "actor_test",
+                "X-RPCS-Request-Hash": digest,
+                "X-RPCS-Spec-Hash": "spec_test",
+            }
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                first = await cli.post("/v1/runs", json=body, headers=headers(body))
+                assert first.status == 202
+                first_data = await first.json()
+                for _ in range(100):
+                    if mock_agent.run_conversation.call_count == 1:
+                        break
+                    await asyncio.sleep(0.01)
+                assert mock_agent.run_conversation.call_count == 1
+
+                replay = await cli.post("/v1/runs", json=body, headers=headers(body))
+                assert replay.status == 200
+                replay_data = await replay.json()
+                assert replay_data["run_id"] == first_data["run_id"]
+                assert replay_data["replayed"] is True
+                assert mock_agent.run_conversation.call_count == 1
+
+                changed = {"input": "different"}
+                conflict = await cli.post("/v1/runs", json=changed, headers=headers(changed))
+                assert conflict.status == 409
+
+                operation = await cli.get("/internal/operations/op_test_1")
+                assert operation.status == 200
+                operation_data = await operation.json()
+                assert operation_data["object_id"] == first_data["run_id"]
+                assert operation_data["actor_id"] == "actor_test"
+
     @pytest.mark.asyncio
     async def test_start_returns_202(self, adapter):
         app = _create_runs_app(adapter)

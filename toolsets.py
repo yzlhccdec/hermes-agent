@@ -61,6 +61,8 @@ _HERMES_CORE_TOOLS = [
     "text_to_speech",
     # Planning & memory
     "todo", "memory",
+    # RPCS local capability bridge (hidden by its check_fn outside RPCS deployments)
+    "rpcs_onboard_ssh_host",
     # NOTE: the desktop Project tools (project_list/create/switch) are
     # deliberately NOT here. They only make sense where a GUI can follow the
     # move, so they live in the `project` toolset and are enabled solely by the

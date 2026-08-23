@@ -12373,6 +12373,38 @@ def test_apply_pending_model_switch_runs_queued_pick(monkeypatch):
     assert calls == ["anthropic/claude-sonnet-4.6"]
 
 
+def test_rpcs_route_is_applied_to_live_agent_before_turn(monkeypatch):
+    import types
+
+    calls = []
+    agent = types.SimpleNamespace(
+        model="claude-opus-4.6", provider="nous", reasoning_config=None
+    )
+    session = {
+        "agent": agent,
+        "_rpcs_dispatch": {"route": {
+            "runtime": "hermes-loop", "provider": "openai-codex",
+            "model": "gpt-5.4", "reasoning_effort": "high",
+        }},
+    }
+
+    def fake_switch(sid, current, raw, **kwargs):
+        calls.append((sid, raw, kwargs))
+        current["agent"].model = "gpt-5.4"
+        current["agent"].provider = "openai-codex"
+        return {"value": "gpt-5.4", "confirm_required": False}
+
+    monkeypatch.setattr(server, "_apply_model_switch", fake_switch)
+    monkeypatch.setattr(server, "_persist_live_session_runtime", lambda _session: None)
+
+    server._rpcs_apply_prompt_route("sid", session)
+
+    assert calls[0][1] == "gpt-5.4 --provider openai-codex"
+    assert calls[0][2]["persist_override"] is False
+    assert agent.reasoning_config == {"enabled": True, "effort": "high"}
+    assert session["create_reasoning_override"] == agent.reasoning_config
+
+
 def test_config_set_model_allowed_when_idle(monkeypatch):
     """Regression guard: idle sessions can still switch models."""
     seen = {"called": False}
