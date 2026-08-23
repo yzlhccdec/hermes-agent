@@ -4105,12 +4105,18 @@ def resolve_codex_runtime_credentials(
         data = _read_codex_tokens()
     except AuthError as exc:
         read_error = exc
-        if getattr(exc, "relogin_required", False) and getattr(exc, "code", None) in {
+        error_code = getattr(exc, "code", None)
+        recover_from_cli = error_code in {
             "codex_auth_missing_access_token",
             "codex_auth_missing_refresh_token",
             "codex_auth_invalid_shape",
-        }:
-            imported = _recover_codex_tokens_from_cli(str(getattr(exc, "code", None) or "auth_error"))
+        }
+        if error_code == "codex_auth_missing":
+            # Preserve the established pool fallback: an explicitly managed
+            # pool credential takes precedence over the Codex CLI singleton.
+            recover_from_cli = not bool(_pool_codex_access_token())
+        if getattr(exc, "relogin_required", False) and recover_from_cli:
+            imported = _recover_codex_tokens_from_cli(str(error_code or "auth_error"))
             if imported:
                 data = {"tokens": imported, "last_refresh": imported.get("last_refresh")}
             else:
